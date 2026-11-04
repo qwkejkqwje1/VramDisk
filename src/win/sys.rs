@@ -404,9 +404,25 @@ pub fn spawn_self(args: &[&str]) -> Result<std::process::Child, String> {
 
 /// Вопрос «Да/Нет»; `true` — «Да».
 pub fn ask_box(title: &str, text: &str) -> bool {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{IDYES, MB_ICONWARNING, MB_SETFOREGROUND, MB_YESNO};
-    unsafe {
-        MessageBoxW(std::ptr::null_mut(), wide(text).as_ptr(), wide(title).as_ptr(), MB_YESNO | MB_ICONWARNING | MB_SETFOREGROUND)
-            == IDYES
-    }
+    use windows_sys::Win32::UI::WindowsAndMessaging::{IDYES, MB_ICONWARNING, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO};
+    // Окна у процесса нет — сообщение поверх остальных, чтобы его заметили.
+    let flags = MB_YESNO | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST;
+    unsafe { MessageBoxW(std::ptr::null_mut(), wide(text).as_ptr(), wide(title).as_ptr(), flags) == IDYES }
+}
+
+/// Процесс без окна Windows считает фоновым и может замедлять ради экономии
+/// энергии (Power Throttling). Фоновая часть обслуживает диск — отказаться.
+pub fn no_power_throttling() {
+    use windows_sys::Win32::System::Threading::{
+        ProcessPowerThrottling, SetProcessInformation, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_STATE,
+    };
+    let st = PROCESS_POWER_THROTTLING_STATE {
+        Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        StateMask: 0,
+    };
+    let size = std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32;
+    // Не получилось (старая Windows) — не страшно.
+    unsafe { SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &st as *const _ as *const _, size) };
 }

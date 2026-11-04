@@ -8,7 +8,7 @@
 //! При входе в Windows (`--autostart`) фоновая часть создаёт диск сама,
 //! без окна. Фоновая часть завершается сама после отключения диска.
 
-use super::engine::{CreateRequest, Engine, Event};
+use super::engine::{CreateRequest, Engine, Event, View};
 use super::pipe::{self, PipeServer};
 use super::platform;
 use super::plan;
@@ -30,6 +30,9 @@ pub const EXIT_PIPE: i32 = 4;
 const KEEP_EVENTS: usize = 64;
 /// Сколько ждать окно после отключения диска (чтобы оно узнало итог).
 const LINGER: Duration = Duration::from_secs(3);
+/// Сколько беда с диском должна продержаться, чтобы о ней сказать
+/// (сервер на миг останавливается и при отключении диска извне).
+const TROUBLE_AFTER: Duration = Duration::from_secs(3);
 
 #[derive(Default)]
 struct Shared {
@@ -128,6 +131,7 @@ fn run(req: CreateRequest, origin: Origin) -> i32 {
         log("фоновая часть уже работает — вторая не нужна");
         return EXIT_ALREADY_RUNNING;
     };
+    sys::no_power_throttling();
     let engine = Engine::new(Arc::new(|| {}));
     let shared = Arc::new(Mutex::new(Shared::default()));
     let pid = std::process::id();
@@ -182,6 +186,8 @@ fn run(req: CreateRequest, origin: Origin) -> i32 {
     engine.create(req);
     let mut failure = None;
     let mut idle_since: Option<Instant> = None;
+    let mut trouble_since: Option<Instant> = None;
+    let mut told = false;
     loop {
         std::thread::sleep(Duration::from_millis(200));
         let events = engine.events();
@@ -213,6 +219,20 @@ fn run(req: CreateRequest, origin: Origin) -> i32 {
         let (asked, all_delivered) = (g.asked, g.delivered >= g.seq);
         drop(g);
         engine.check_external();
+        if !told {
+            match trouble(&engine.view()) {
+                Some(text) if trouble_since.get_or_insert_with(Instant::now).elapsed() >= TROUBLE_AFTER => {
+                    told = true;
+                    // Открытое окно показывает это само.
+                    if asked.is_none_or(|a| a.elapsed() > Duration::from_secs(2)) {
+                        log(format!("окно закрыто — сообщаю: {text}"));
+                        tell(text);
+                    }
+                }
+                Some(_) => {}
+                None => trouble_since = None,
+            }
+        }
         if !engine.is_idle() {
             idle_since = None;
             continue;
@@ -242,4 +262,31 @@ fn run(req: CreateRequest, origin: Origin) -> i32 {
         }
     }
     0
+}
+
+/// Беда с подключённым диском, о которой надо знать, даже если окно закрыто.
+fn trouble(view: &View) -> Option<String> {
+    match view {
+        View::Mounted(m) if m.stats.device_lost => Some(format!(
+            "Диск {}: видеокарта была сброшена — драйвер перезапустился, данные в видеопамяти потеряны. \
+             Скопируйте с диска то, что ещё читается, и отключите его.",
+            m.letter
+        )),
+        View::Mounted(m) if !m.running => Some(format!(
+            "Диск {}: перестал отвечать — сервер диска остановился. Отключите диск в окне VramDisk.",
+            m.letter
+        )),
+        _ => None,
+    }
+}
+
+/// Сообщение без окна — в своём потоке, чтобы диск обслуживался дальше.
+fn tell(text: String) {
+    let _ = std::thread::Builder::new().name("trouble-box".into()).spawn(move || {
+        if sys::ask_box("VramDisk", &format!("{text}\n\nОткрыть VramDisk?")) {
+            if let Err(e) = sys::spawn_self(&[]) {
+                log(format!("окно не запустилось: {e}"));
+            }
+        }
+    });
 }
