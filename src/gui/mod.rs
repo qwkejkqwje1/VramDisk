@@ -2,9 +2,22 @@
 
 mod app;
 mod engine;
+mod link;
+#[cfg(windows)]
+mod pipe;
+mod plan;
 mod platform;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod proto;
+#[cfg(windows)]
+mod remote;
+#[cfg(windows)]
+mod server;
 mod theme;
 mod widgets;
+
+#[cfg(windows)]
+pub use server::{autostart, serve};
 
 use eframe::egui;
 use std::sync::Arc;

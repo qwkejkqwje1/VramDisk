@@ -94,6 +94,11 @@ mod imp {
         }
     }
 
+    /// Работает ли фоновая часть VramDisk с номером процесса `pid`.
+    pub fn server_alive(pid: u32) -> bool {
+        sys::process_is_vramdisk(pid)
+    }
+
     /// Диск от прошлого запуска (процесс `pid`), сервер которого уже не
     /// работает. Проверяем, что устройство именно наше: номер и буква могли
     /// с тех пор достаться другому диску ImDisk.
@@ -285,6 +290,9 @@ mod imp {
     }
     pub fn set_autostart(_on: bool) -> Result<(), String> {
         Ok(())
+    }
+    pub fn server_alive(_pid: u32) -> bool {
+        false
     }
     pub fn stale_exists(_l: char, _d: Option<u32>, _pid: u32) -> bool {
         false

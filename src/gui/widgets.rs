@@ -393,7 +393,7 @@ pub fn sparkline(ui: &mut Ui, pal: &Palette, data: &[(f32, f32)], height: f32) {
 }
 
 /// Строка шага создания диска.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum StepMark {
     Pending,
     Running,

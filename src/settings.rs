@@ -1,8 +1,10 @@
 //! Настройки и место для файлов программы.
 //!
 //! Всё своё VramDisk хранит рядом с vramdisk.exe: настройки `vramdisk.json`,
-//! журнал `vramdisk.log` (и предыдущий — `vramdisk.old.log`). Переменная
-//! окружения `VRAMDISK_HOME` задаёт другую папку (для тестов).
+//! журнал `vramdisk.log` (и предыдущий — `vramdisk.old.log`), запись о
+//! подключённом диске `vramdisk.disk.json` (её ведёт фоновая часть, пока
+//! держит диск). Переменная окружения `VRAMDISK_HOME` задаёт другую папку
+//! (для тестов).
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -84,11 +86,44 @@ impl FillFirst {
 }
 
 /// Подключённый диск — чтобы после аварийного завершения убрать «зависший».
+/// `pid` — процесс, который обслуживает диск (фоновая часть).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MountRecord {
     pub letter: char,
     pub device: Option<u32>,
     pub pid: u32,
+}
+
+impl MountRecord {
+    pub fn path() -> PathBuf {
+        app_dir().join("vramdisk.disk.json")
+    }
+
+    pub fn load() -> Option<Self> {
+        let t = std::fs::read_to_string(Self::path()).ok()?;
+        serde_json::from_str(&t).ok()
+    }
+
+    pub fn save(&self) -> Result<(), String> {
+        let path = Self::path();
+        let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
+        write_atomic(&path, json.as_bytes()).map_err(|e| format!("не удалось записать {}: {e}", path.display()))
+    }
+
+    pub fn clear() {
+        let _ = std::fs::remove_file(Self::path());
+    }
+}
+
+/// Запись через временный файл: при сбое не остаётся половины файла.
+fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, data)?;
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -112,6 +147,9 @@ pub struct Settings {
     pub vram_reserve_mb: u64,
     /// Сколько оперативной памяти оставлять системе.
     pub ram_reserve_mb: u64,
+    /// Запись о диске версии 2.0 (теперь — в `vramdisk.disk.json`):
+    /// читается один раз при обновлении.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mounted: Option<MountRecord>,
     pub theme: ThemeChoice,
     /// Настройки только что созданы (файла не было).
@@ -239,14 +277,8 @@ impl Settings {
 
     pub fn save(&self) -> Result<(), String> {
         let path = Self::path();
-        let tmp = path.with_extension("json.tmp");
         let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        let fail = |e: std::io::Error| format!("не удалось сохранить настройки в {}: {e}", path.display());
-        std::fs::write(&tmp, json).map_err(fail)?;
-        std::fs::rename(&tmp, &path).map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            fail(e)
-        })
+        write_atomic(&path, json.as_bytes()).map_err(|e| format!("не удалось сохранить настройки в {}: {e}", path.display()))
     }
 
     /// Приводит значения к допустимым.
@@ -291,5 +323,17 @@ mod tests {
         assert_eq!(old.ram_mb, 1024);
         assert_eq!(old.letter, 'V');
         assert_eq!(clean_label("ОченьДлинноеИмя", FsKind::ExFat).chars().count(), 11);
+    }
+
+    #[test]
+    fn write_atomic_replaces() {
+        let dir = std::env::temp_dir().join(format!("vramdisk-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("x.json");
+        write_atomic(&p, b"1").unwrap();
+        write_atomic(&p, b"22").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"22");
+        assert!(!dir.join("x.json.tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

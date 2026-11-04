@@ -1,6 +1,8 @@
 //! Главное окно.
 
-use super::engine::{test_line, CreateRequest, Engine, Event, Phase, Step};
+use super::engine::{test_line, CreatingView, Event, MountedView, Notify, View};
+use super::link::Link;
+use super::plan::{self, bytes_gb, floor_step, gb_to_bytes, STEP_GB};
 use super::platform;
 use super::theme::{self, bold, font, Palette};
 use super::widgets::{self as w, ButtonKind, Icon};
@@ -8,15 +10,11 @@ use eframe::egui::{self, vec2, Align, Color32, Id, Layout, Margin, RichText, Vie
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use vramdisk::logger::{self, log};
-use vramdisk::disk::Kind;
 use vramdisk::gpu::{self, Api, GpuInfo, GpuKind, GpuProbe};
-use vramdisk::pool::SelfTest;
+use vramdisk::logger::{self, log};
 use vramdisk::settings::{clean_label, FillFirst, FsKind, MountRecord, Settings, ThemeChoice};
-use vramdisk::stats::Stats;
 use vramdisk::util::{size as fsize, speed, GIB, MIB};
 
-const STEP_GB: f64 = 0.25;
 const SAMPLES: usize = 120;
 
 /// Результат фоновой задачи: появляется, когда она завершится.
@@ -33,8 +31,31 @@ struct Startup {
     done: bool,
     imdisk: Option<String>,
     autostart: bool,
+    record: RecordCheck,
+}
+
+/// Что с записью о диске от прошлого запуска.
+#[derive(Default, Clone)]
+struct RecordCheck {
+    /// Диск остался, а обслуживать его некому.
     stale: Option<MountRecord>,
-    clear_record: bool,
+    /// Запись устарела — удалить.
+    clear: bool,
+}
+
+/// Запись о диске: её ведёт фоновая часть (в версии 2.0 — окно, в
+/// настройках). Если фоновая часть жива, диск в порядке.
+fn check_record(legacy: Option<MountRecord>) -> RecordCheck {
+    let Some(r) = MountRecord::load().or(legacy) else { return RecordCheck::default() };
+    if platform::server_alive(r.pid) {
+        return RecordCheck::default();
+    }
+    if platform::stale_exists(r.letter, r.device, r.pid) {
+        log(format!("найден зависший диск {}: от прошлого запуска", r.letter));
+        RecordCheck { stale: Some(r), clear: false }
+    } else {
+        RecordCheck { stale: None, clear: true }
+    }
 }
 
 enum Modal {
@@ -45,39 +66,10 @@ enum Modal {
     Log,
 }
 
-struct CreatingView {
-    letter: char,
-    total: u64,
-    steps: Vec<Step>,
-    can_cancel: bool,
-}
-
-struct MountedView {
-    letter: char,
-    label: String,
-    fs: FsKind,
-    size: u64,
-    ram: u64,
-    vram: u64,
-    first: Kind,
-    gpu_name: Option<String>,
-    gpu_api: Option<String>,
-    test: Option<SelfTest>,
-    notes: Vec<String>,
-    stats: Arc<Stats>,
-    since: Instant,
-    running: bool,
-}
-
-enum View {
-    Idle,
-    Creating(CreatingView),
-    Mounted(MountedView),
-    Removing(char, bool),
-}
-
 pub struct VramApp {
-    engine: Engine,
+    link: Link,
+    /// Диск создаётся по кнопке в этом окне (а не автозапуском).
+    created_here: bool,
     settings: Settings,
     demo: bool,
     autostart_pending: bool,
@@ -94,6 +86,10 @@ pub struct VramApp {
     stale: Option<MountRecord>,
     /// Фоновое снятие зависшего диска: результат появится здесь.
     stale_job: Option<JobResult>,
+    /// Проверка записи о диске после того, как пропала фоновая часть.
+    record_job: Option<Arc<Mutex<Option<RecordCheck>>>>,
+    /// Строки журнала для окна «Журнал» и когда они прочитаны.
+    log_lines: Option<(Instant, Vec<String>)>,
     /// Букву выбрали вручную — не менять её автоматически.
     letters_touched: bool,
     mem: (u64, u64),
@@ -120,18 +116,6 @@ fn theme_pref(t: ThemeChoice) -> egui::ThemePreference {
         ThemeChoice::Light => egui::ThemePreference::Light,
         ThemeChoice::Dark => egui::ThemePreference::Dark,
     }
-}
-
-fn gb_to_bytes(gb: f64) -> u64 {
-    ((gb * 1024.0).round().max(0.0) as u64) * MIB
-}
-
-fn floor_step(gb: f64) -> f64 {
-    ((gb / STEP_GB).floor() * STEP_GB).max(0.0)
-}
-
-fn bytes_gb(b: u64) -> f64 {
-    b as f64 / GIB as f64
 }
 
 fn ago(d: Duration) -> String {
@@ -167,7 +151,11 @@ impl VramApp {
         theme::install(&cc.egui_ctx);
         let settings = Settings::load();
         cc.egui_ctx.set_theme(theme_pref(settings.theme));
-        let engine = Engine::new(cc.egui_ctx.clone());
+        let notify: Notify = {
+            let ctx = cc.egui_ctx.clone();
+            Arc::new(move || ctx.request_repaint())
+        };
+        let link = Link::new(notify, demo);
 
         // Видеокарты опрашиваются в фоне: запуск Vulkan занимает доли секунды.
         let gpu = Arc::new(Mutex::new(if demo { GpuState::Ready(vec![demo_gpu()]) } else { GpuState::Loading }));
@@ -195,20 +183,14 @@ impl VramApp {
         // Проверки при запуске: ImDisk, автозапуск, зависший диск.
         let startup = Arc::new(Mutex::new(Startup::default()));
         {
-            let (st, ctx, rec) = (startup.clone(), cc.egui_ctx.clone(), settings.mounted.clone());
+            let (st, ctx, legacy) = (startup.clone(), cc.egui_ctx.clone(), settings.mounted.clone());
             let _ = std::thread::Builder::new().name("startup-checks".into()).spawn(move || {
-                let mut s = Startup { imdisk: platform::imdisk_problem(), autostart: platform::autostart_enabled(), ..Default::default() };
-                // Запись о диске при запуске — всегда от прошлого процесса:
-                // второй экземпляр не запустится, а номер процесса мог
-                // достаться нам же. Свой ли это диск, решает stale_exists.
-                if let Some(r) = rec {
-                    if platform::stale_exists(r.letter, r.device, r.pid) {
-                        log(format!("найден зависший диск {}: от прошлого запуска", r.letter));
-                        s.stale = Some(r);
-                    } else {
-                        s.clear_record = true;
-                    }
-                }
+                let mut s = Startup {
+                    imdisk: platform::imdisk_problem(),
+                    autostart: platform::autostart_enabled(),
+                    record: check_record(legacy),
+                    ..Default::default()
+                };
                 s.done = true;
                 *st.lock().unwrap() = s;
                 ctx.request_repaint();
@@ -216,7 +198,8 @@ impl VramApp {
         }
 
         Self {
-            engine,
+            link,
+            created_here: false,
             ram_gb: bytes_gb(settings.ram_mb * MIB),
             vram_gb: bytes_gb(settings.vram_mb * MIB),
             settings,
@@ -232,6 +215,8 @@ impl VramApp {
             autostart_on: false,
             stale: None,
             stale_job: None,
+            record_job: None,
+            log_lines: None,
             letters_touched: false,
             mem: (0, 0),
             mem_at: None,
@@ -283,11 +268,11 @@ impl VramApp {
     /// занимается по мере записи, поэтому предел может быть больше, чем
     /// свободно сейчас (об этом предупреждаем).
     fn max_ram_gb(&self) -> f64 {
-        floor_step(bytes_gb(self.mem.0.saturating_sub(self.settings.ram_reserve_mb * MIB)))
+        plan::max_ram_gb(self.mem.0, self.settings.ram_reserve_mb)
     }
 
     fn max_vram_gb(&self, g: Option<&GpuInfo>) -> f64 {
-        g.map(|g| floor_step(bytes_gb(g.vram_total.saturating_sub(self.settings.vram_reserve_mb * MIB)))).unwrap_or(0.0)
+        plan::max_vram_gb(g, self.settings.vram_reserve_mb)
     }
 
     /// Размеры частей, которые получит диск по кнопке «Создать».
@@ -299,32 +284,7 @@ impl VramApp {
     }
 
     fn view(&self) -> View {
-        self.engine.with(|p| match p {
-            Phase::Idle => View::Idle,
-            Phase::Creating(c) => View::Creating(CreatingView {
-                letter: c.letter,
-                total: c.total,
-                steps: c.steps.clone(),
-                can_cancel: c.can_cancel,
-            }),
-            Phase::Mounted(m) => View::Mounted(MountedView {
-                letter: m.letter,
-                label: m.label.clone(),
-                fs: m.fs,
-                size: m.size,
-                ram: m.ram,
-                vram: m.vram,
-                first: m.first,
-                gpu_name: m.gpu_name.clone(),
-                gpu_api: m.gpu_api.clone(),
-                test: m.test,
-                notes: m.notes.clone(),
-                stats: m.stats.clone(),
-                since: m.since,
-                running: m.server.running(),
-            }),
-            Phase::Removing { letter, force } => View::Removing(*letter, *force),
-        })
+        self.link.view()
     }
 
     /// Фоновые результаты, события движка, замеры.
@@ -343,8 +303,8 @@ impl VramApp {
             if s.done {
                 self.imdisk_problem = s.imdisk.clone();
                 self.autostart_on = s.autostart;
-                self.stale = s.stale.clone();
-                let clear = s.clear_record;
+                self.stale = s.record.stale.clone();
+                let clear = s.record.clear;
                 drop(s);
                 self.startup_applied = true;
                 if let Some(p) = &self.imdisk_problem {
@@ -355,10 +315,18 @@ impl VramApp {
                     self.save();
                 }
                 if clear {
-                    self.settings.mounted = None;
-                    self.save();
+                    self.forget_record();
                 }
             }
+        }
+
+        let checked = self.record_job.as_ref().and_then(|j| j.lock().unwrap().take());
+        if let Some(c) = checked {
+            self.record_job = None;
+            if c.clear {
+                self.forget_record();
+            }
+            self.stale = c.stale;
         }
 
         let finished = self.stale_job.as_ref().and_then(|j| j.lock().unwrap().take());
@@ -369,6 +337,7 @@ impl VramApp {
                 (Ok(()), Some(st)) => {
                     log(format!("зависший диск {}: убран", st.letter));
                     self.stale = None;
+                    MountRecord::clear();
                     self.settings.mounted = None;
                     // Буква освободилась — вернуть её, если её выбирали раньше.
                     self.letters = platform::free_letters();
@@ -401,12 +370,8 @@ impl VramApp {
                 self.ram_gb = self.ram_gb.min(max_r);
                 self.vram_gb = self.vram_gb.min(max_v);
             }
-            if !self.letters.contains(&self.settings.letter) {
-                if let Some(&c) = ['V', 'W', 'X', 'Y', 'Z', 'R', 'T'].iter().find(|c| self.letters.contains(c)) {
-                    self.settings.letter = c;
-                } else if let Some(&c) = self.letters.last() {
-                    self.settings.letter = c;
-                }
+            if let Some(c) = plan::pick_letter(self.settings.letter, &self.letters) {
+                self.settings.letter = c;
             }
             self.sizes_ready = true;
         }
@@ -420,23 +385,26 @@ impl VramApp {
             }
         }
 
-        for e in self.engine.events() {
+        self.link.tick();
+        for e in self.link.events() {
             // Буквы и память изменились — обновить сразу, а не через 2 с.
             self.mem_at = None;
             ctx.request_repaint();
             match e {
-                Event::Created { letter, device, notes } => {
-                    for n in &notes {
-                        log(n);
+                Event::Created { letter, notes, .. } => {
+                    if !self.link.background() {
+                        for n in &notes {
+                            log(n);
+                        }
                     }
-                    self.settings.mounted = Some(MountRecord { letter, device, pid: std::process::id() });
-                    self.save();
                     self.samples.clear();
                     self.last = None;
                     self.space_at = None;
-                    if self.settings.open_explorer && !self.minimize_after_create {
+                    // Диск, созданный без окна (автозапуском), Проводник не открывает.
+                    if self.settings.open_explorer && self.created_here && !self.minimize_after_create {
                         platform::open_drive(letter);
                     }
+                    self.created_here = false;
                     if self.minimize_after_create {
                         self.minimize_after_create = false;
                         ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
@@ -444,6 +412,9 @@ impl VramApp {
                 }
                 Event::Failed { title, text } => {
                     self.minimize_after_create = false;
+                    if !matches!(self.view(), View::Mounted(_)) {
+                        self.created_here = false;
+                    }
                     if self.exit_after_remove {
                         self.exit_after_remove = false;
                     }
@@ -451,14 +422,12 @@ impl VramApp {
                 }
                 Event::Busy { text } => {
                     if self.exit_after_remove {
-                        self.engine.remove(true);
+                        self.link.remove(true);
                     } else {
                         self.modal = Some(Modal::Busy(text));
                     }
                 }
                 Event::Removed => {
-                    self.settings.mounted = None;
-                    self.save();
                     self.mem_at = None;
                     self.space = None;
                     if self.exit_after_remove {
@@ -466,11 +435,29 @@ impl VramApp {
                         ctx.send_viewport_cmd(ViewportCommand::Close);
                     }
                 }
+                Event::Lost { letter } => {
+                    self.exit_after_remove = false;
+                    self.modal = Some(Modal::Error {
+                        title: "Фоновая часть VramDisk завершилась".into(),
+                        text: format!(
+                            "Диск {letter}: больше не обслуживается: процесс VramDisk, который его держал, закрылся — \
+                             аварийно или через Диспетчер задач. Подробности — в журнале."
+                        ),
+                    });
+                    // Остался ли диск — проверить и предложить убрать.
+                    let job = Arc::new(Mutex::new(None));
+                    let (j, ctx2, legacy) = (job.clone(), ctx.clone(), self.settings.mounted.clone());
+                    let _ = std::thread::Builder::new().name("record-check".into()).spawn(move || {
+                        *j.lock().unwrap() = Some(check_record(legacy));
+                        ctx2.request_repaint();
+                    });
+                    self.record_job = Some(job);
+                }
             }
         }
 
         if let View::Mounted(m) = view {
-            let s = m.stats.snapshot();
+            let s = m.stats;
             let (rd, wr) = (s.read_ram + s.read_vram, s.write_ram + s.write_vram);
             match self.last {
                 Some((t, r0, w0)) => {
@@ -489,10 +476,6 @@ impl VramApp {
             if self.space_at.is_none_or(|t| now - t > Duration::from_secs(1)) {
                 self.space = platform::disk_space(m.letter);
                 self.space_at = Some(now);
-            }
-            // Диск сняли другой программой (например, ImDisk): сервер получил CLOSE.
-            if s.server_stopped && !platform::letter_used(m.letter) {
-                self.engine.forget();
             }
             ctx.request_repaint_after(Duration::from_millis(500));
         } else {
@@ -532,23 +515,16 @@ impl VramApp {
         }
         self.settings.fresh = false;
         self.save();
-        let first = match self.settings.fill_first {
-            FillFirst::Ram => Kind::Ram,
-            FillFirst::Vram => Kind::Vram,
-        };
-        self.engine.create(CreateRequest {
-            size: ram + vram,
-            ram,
-            vram,
-            first: if vram == 0 { Kind::Ram } else { first },
-            letter: self.settings.letter,
-            label: self.settings.label.clone(),
-            fs: self.settings.fs,
-            compress: self.settings.compress,
-            gpu_uuid: g.map(|g| g.uuid),
-            vram_reserve: self.settings.vram_reserve_mb * MIB,
-            demo: self.demo,
-        });
+        self.created_here = true;
+        self.link.create(plan::request(&self.settings, ram, vram, self.settings.letter, g.as_ref(), self.demo));
+    }
+
+    /// Убрать устаревшую запись о диске (и запись версии 2.0 в настройках).
+    fn forget_record(&mut self) {
+        MountRecord::clear();
+        if self.settings.mounted.take().is_some() {
+            self.save();
+        }
     }
 
     fn handle_close(&mut self, ctx: &egui::Context, view: &View) {
@@ -559,13 +535,17 @@ impl VramApp {
             View::Idle => {}
             View::Creating(_) => {
                 ctx.send_viewport_cmd(ViewportCommand::CancelClose);
-                self.engine.cancel();
+                self.link.cancel();
+            }
+            // Диск живёт в фоновой части: окно просто закрывается.
+            View::Mounted(_) | View::Removing { .. } if self.link.background() => {
+                log("окно закрыто, диск работает в фоне");
             }
             View::Mounted(_) => {
                 ctx.send_viewport_cmd(ViewportCommand::CancelClose);
                 self.modal = Some(Modal::ConfirmClose);
             }
-            View::Removing(..) => {
+            View::Removing { .. } => {
                 ctx.send_viewport_cmd(ViewportCommand::CancelClose);
                 self.exit_after_remove = true;
             }
@@ -589,7 +569,7 @@ impl VramApp {
                     View::Creating(c) => (format!("Создание {}:", c.letter), pal.accent),
                     View::Mounted(m) if !m.running => (format!("{}: не отвечает", m.letter), pal.danger),
                     View::Mounted(m) => (format!("Диск {}: работает", m.letter), pal.ok),
-                    View::Removing(l, _) => (format!("Отключение {l}:"), pal.warn),
+                    View::Removing { letter, .. } => (format!("Отключение {letter}:"), pal.warn),
                 };
                 let bg = if matches!(view, View::Idle) { pal.track } else { fg.gamma_multiply(0.14) };
                 w::pill(ui, &text, fg, bg, !matches!(view, View::Idle));
@@ -677,7 +657,10 @@ impl VramApp {
             w::banner(ui, pal.warn, pal.warn_bg, Icon::Warning, |ui| {
                 ui.label(RichText::new(format!("Остался диск {}: от прошлого запуска", st.letter)).font(bold(14.5)).color(pal.text));
                 ui.label(
-                    RichText::new("Программа была закрыта аварийно, и этот диск больше не работает: обращения к нему зависают. Его стоит убрать.")
+                    RichText::new(
+                        "VramDisk был закрыт аварийно (или через Диспетчер задач), и этот диск больше не работает: обращения к нему \
+                         зависают. Его стоит убрать.",
+                    )
                         .font(font(13.0))
                         .color(pal.weak),
                 );
@@ -966,8 +949,8 @@ impl VramApp {
             })
         } else if total == 0 {
             Some("Выберите размер диска".to_string())
-        } else if total < 256 * MIB {
-            Some("Минимальный размер — 256 МБ".to_string())
+        } else if total < plan::MIN_SIZE {
+            Some(format!("Минимальный размер — {}", fsize(plan::MIN_SIZE)))
         } else if !self.letters.contains(&letter) {
             Some(format!("Буква {letter}: занята — выберите другую"))
         } else {
@@ -1000,7 +983,7 @@ impl VramApp {
             if c.can_cancel {
                 ui.add_space(6.0);
                 if w::button(ui, pal, ButtonKind::Secondary, "Отмена", None, 140.0, true).clicked() {
-                    self.engine.cancel();
+                    self.link.cancel();
                 }
             }
         });
@@ -1014,7 +997,7 @@ impl VramApp {
     // ---------- подключённый диск ----------
 
     fn mounted_view(&mut self, ui: &mut egui::Ui, pal: &Palette, m: &MountedView) {
-        let s = m.stats.snapshot();
+        let s = m.stats;
         self.storage_banner(ui, pal);
         if s.device_lost {
             w::banner(ui, pal.danger, pal.danger_bg, Icon::Warning, |ui| {
@@ -1044,7 +1027,12 @@ impl VramApp {
                     let label = if m.label.is_empty() { "Локальный диск".to_string() } else { m.label.clone() };
                     ui.label(RichText::new(format!("{}:  {}", m.letter, label)).font(bold(21.0)).color(pal.text));
                     ui.label(
-                        RichText::new(format!("{} · {} · работает {}", m.fs.label(), fsize(m.size), ago(m.since.elapsed())))
+                        RichText::new(format!(
+                            "{} · {} · работает {}",
+                            m.fs.label(),
+                            fsize(m.size),
+                            ago(Duration::from_millis(m.uptime_ms))
+                        ))
                             .font(font(13.0))
                             .color(pal.weak),
                     );
@@ -1130,6 +1118,26 @@ impl VramApp {
                 line.push_str(&format!(" · возвращено после удаления файлов {}", fsize(s.freed())));
             }
             ui.label(RichText::new(line).font(font(12.5)).color(pal.faint));
+            // Столько же показывает Диспетчер задач (частный рабочий набор).
+            // Пусто, если Windows не ответила.
+            let total = self.link.server_mem().map(|m| m.private_ws.unwrap_or(m.private)).filter(|&t| t > 0);
+            if let Some(total) = total {
+                let mut t = format!("Фоновая часть VramDisk занимает {} оперативной памяти", fsize(total));
+                if s.held_ram == 0 {
+                    t.push_str(": драйвер видеокарты и служебные данные VramDisk, данных диска в ней нет");
+                } else if s.held_ram < total {
+                    t.push_str(&format!(
+                        ": данные диска — {}, остальное — драйвер видеокарты и служебные данные VramDisk",
+                        fsize(s.held_ram)
+                    ));
+                } else {
+                    // Не все страницы данных сейчас в рабочем наборе — не
+                    // гадаем почему, просто показываем обе цифры.
+                    t.push_str(&format!("; данные диска в оперативной памяти — {}", fsize(s.held_ram)));
+                }
+                t.push('.');
+                ui.label(RichText::new(t).font(font(12.5)).color(pal.faint));
+            }
         });
 
         // Активность
@@ -1179,11 +1187,13 @@ impl VramApp {
                 self.modal = Some(Modal::ConfirmRemove);
             }
         });
-        ui.label(
-            RichText::new("Диск работает, пока открыта программа. Окно можно свернуть; при выключении Windows диск отключится сам.")
-                .font(font(12.5))
-                .color(pal.faint),
-        );
+        let hint = if self.link.background() {
+            "Окно можно закрыть: диск продолжит работать в фоне, а VramDisk можно открыть снова в любой момент. Отключайте диск \
+             этой кнопкой, а не через Диспетчер задач. При выключении Windows диск отключится сам."
+        } else {
+            "Диск работает, пока открыта программа. Окно можно свернуть; при выключении Windows диск отключится сам."
+        };
+        ui.label(RichText::new(hint).font(font(12.5)).color(pal.faint));
     }
 
     fn removing_view(&self, ui: &mut egui::Ui, pal: &Palette, letter: char, force: bool) {
@@ -1225,7 +1235,7 @@ impl VramApp {
                         Some(0) => keep = false,
                         Some(_) => {
                             keep = false;
-                            self.engine.remove(false);
+                            self.link.remove(false);
                         }
                         None => {}
                     }
@@ -1248,11 +1258,11 @@ impl VramApp {
                         Some(0) => keep = false,
                         Some(1) => {
                             keep = false;
-                            self.engine.remove(false);
+                            self.link.remove(false);
                         }
                         Some(_) => {
                             keep = false;
-                            self.engine.remove(true);
+                            self.link.remove(true);
                         }
                         None => {}
                     }
@@ -1277,7 +1287,7 @@ impl VramApp {
                         Some(_) => {
                             keep = false;
                             self.exit_after_remove = true;
-                            self.engine.remove(true);
+                            self.link.remove(true);
                         }
                         None => {}
                     }
@@ -1297,7 +1307,12 @@ impl VramApp {
                 Modal::Log => {
                     ui.set_width((ctx.content_rect().width() - 90.0).clamp(300.0, 620.0));
                     modal_title(ui, pal, Icon::Info, pal.accent, "Журнал");
-                    let lines = logger::recent();
+                    // Файл журнала — вместе со строками фоновой части; раз в секунду.
+                    if self.log_lines.as_ref().is_none_or(|(t, _)| t.elapsed() > Duration::from_secs(1)) {
+                        self.log_lines = Some((Instant::now(), logger::tail()));
+                        ctx.request_repaint_after(Duration::from_secs(1));
+                    }
+                    let lines = self.log_lines.as_ref().map(|(_, l)| l.clone()).unwrap_or_default();
                     egui::Frame::new().fill(pal.track).corner_radius(egui::CornerRadius::same(8)).inner_margin(Margin::same(10)).show(
                         ui,
                         |ui| {
@@ -1421,7 +1436,9 @@ fn modal_text(ui: &mut egui::Ui, pal: &Palette, text: &str) {
 fn modal_buttons(ui: &mut egui::Ui, pal: &Palette, buttons: &[(&str, ButtonKind)]) -> Option<usize> {
     ui.add_space(10.0);
     let mut clicked = None;
-    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+    // Строка ровно по высоте кнопок: иначе после прокручиваемого текста
+    // egui центрирует их в лишнем свободном месте.
+    ui.allocate_ui_with_layout(vec2(ui.available_width(), 42.0), Layout::right_to_left(Align::Center), |ui| {
         for (i, (text, kind)) in buttons.iter().enumerate().rev() {
             let wdt = ui.painter().layout_no_wrap(text.to_string(), bold(14.5), pal.text).size().x + 36.0;
             if w::button(ui, pal, *kind, text, None, wdt.max(96.0), true).clicked() {
@@ -1469,7 +1486,7 @@ impl eframe::App for VramApp {
                             View::Idle => self.idle_view(ui, &pal),
                             View::Creating(c) => self.creating_view(ui, &pal, c),
                             View::Mounted(m) => self.mounted_view(ui, &pal, m),
-                            View::Removing(l, f) => self.removing_view(ui, &pal, *l, *f),
+                            View::Removing { letter, force } => self.removing_view(ui, &pal, *letter, *force),
                         }
                     });
                 });

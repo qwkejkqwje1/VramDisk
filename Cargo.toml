@@ -1,6 +1,6 @@
 [package]
 name = "vramdisk"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2021"
 description = "VramDisk — один диск из оперативной памяти и видеопамяти (ImDisk + Vulkan)"
 license = "MIT"
@@ -39,6 +39,10 @@ windows-sys = { version = "0.61", features = [
   "Win32_System_Diagnostics_Debug",
   "Win32_System_Registry",
   "Win32_System_Services",
+  "Win32_System_Pipes",
+  "Win32_System_ProcessStatus",
+  "Win32_System_RemoteDesktop",
+  "Win32_Security_Authorization",
 ] }
 windows = { version = "0.62", features = [
   "Win32_Foundation",

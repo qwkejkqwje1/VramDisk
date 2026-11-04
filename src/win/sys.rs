@@ -273,3 +273,140 @@ pub fn remove_drive_letter(c: char) {
         DefineDosDeviceW(DDD_REMOVE_DEFINITION, wide(&format!("{c}:")).as_ptr(), std::ptr::null());
     }
 }
+
+/// Мьютекс фоновой части: она одна на сеанс. Принадлежит потоку, который
+/// его получил, и освобождается при `drop` (вызывать из того же потока).
+pub struct ServerGuard(HANDLE);
+
+impl Drop for ServerGuard {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::System::Threading::ReleaseMutex(self.0);
+            CloseHandle(self.0);
+        }
+    }
+}
+
+/// Становится единственной фоновой частью. Предыдущая после отключения
+/// диска ещё несколько секунд отдаёт окну последние события — её ждём до
+/// `wait`. `None` — другая фоновая часть работает.
+pub fn server_instance(wait: std::time::Duration) -> Option<ServerGuard> {
+    use windows_sys::Win32::Foundation::{WAIT_ABANDONED, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+    unsafe {
+        let h = CreateMutexW(std::ptr::null(), 1, wide("Local\\VramDisk.Server").as_ptr());
+        if h.is_null() {
+            crate::logger::log(format!("мьютекс фоновой части: {}", last_error()));
+            return None;
+        }
+        if GetLastError() != ERROR_ALREADY_EXISTS {
+            return Some(ServerGuard(h));
+        }
+        match WaitForSingleObject(h, wait.as_millis().min(u32::MAX as u128 - 1) as u32) {
+            WAIT_OBJECT_0 | WAIT_ABANDONED => Some(ServerGuard(h)),
+            _ => {
+                CloseHandle(h);
+                None
+            }
+        }
+    }
+}
+
+/// Работает ли процесс `pid` и это ли VramDisk (номера процессов
+/// повторяются, поэтому сверяем и имя файла программы).
+pub fn process_is_vramdisk(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
+    use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, WaitForSingleObject, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    if pid == 0 {
+        return false;
+    }
+    unsafe {
+        let h = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            // Процесса нет (или к нему нет доступа — значит, он не наш).
+            return false;
+        }
+        let alive = WaitForSingleObject(h, 0) == WAIT_TIMEOUT;
+        let mut buf = vec![0u16; 1024];
+        let mut n = buf.len() as u32;
+        let named = QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut n) != 0;
+        CloseHandle(h);
+        if !alive {
+            return false;
+        }
+        if !named {
+            return true;
+        }
+        let theirs = std::path::PathBuf::from(String::from_utf16_lossy(&buf[..n as usize]));
+        let ours = std::env::current_exe().ok();
+        let name = |p: &std::path::Path| p.file_name().map(|f| f.to_string_lossy().to_lowercase());
+        match ours {
+            Some(o) => name(&theirs) == name(&o),
+            None => true,
+        }
+    }
+}
+
+/// Память этого процесса: (частный рабочий набор — как в Диспетчере задач,
+/// если Windows его сообщает; выделено всего).
+pub fn process_memory() -> Option<(Option<u64>, u64)> {
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX, PROCESS_MEMORY_COUNTERS_EX2,
+    };
+    unsafe {
+        let mut c: PROCESS_MEMORY_COUNTERS_EX2 = std::mem::zeroed();
+        c.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX2>() as u32;
+        if K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c as *mut _ as *mut PROCESS_MEMORY_COUNTERS, c.cb) != 0 {
+            let pws = (c.PrivateWorkingSetSize > 0).then_some(c.PrivateWorkingSetSize as u64);
+            return Some((pws, c.PrivateUsage as u64));
+        }
+        let mut c: PROCESS_MEMORY_COUNTERS_EX = std::mem::zeroed();
+        c.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+        if K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c as *mut _ as *mut PROCESS_MEMORY_COUNTERS, c.cb) != 0 {
+            return Some((None, c.PrivateUsage as u64));
+        }
+        None
+    }
+}
+
+/// Номер сеанса Windows этого процесса.
+pub fn session_id() -> u32 {
+    use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+    let mut s = 0u32;
+    unsafe { ProcessIdToSessionId(std::process::id(), &mut s) };
+    s
+}
+
+/// Запускает эту же программу с аргументами — отдельно от окна: вне задания
+/// (job), в которое могло попасть окно, и с папкой программы как текущей
+/// (не на диске VramDisk — иначе его нельзя будет отключить).
+pub fn spawn_self(args: &[&str]) -> Result<std::process::Child, String> {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::Threading::CREATE_BREAKAWAY_FROM_JOB;
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let dir = exe.parent().map(std::path::Path::to_path_buf).unwrap_or_else(crate::settings::app_dir);
+    let run = |flags: u32| {
+        std::process::Command::new(&exe)
+            .args(args)
+            .current_dir(&dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(flags)
+            .spawn()
+    };
+    // Выйти из задания можно не всегда (если оно запрещает) — тогда как есть.
+    run(CREATE_BREAKAWAY_FROM_JOB).or_else(|_| run(0)).map_err(|e| e.to_string())
+}
+
+/// Вопрос «Да/Нет»; `true` — «Да».
+pub fn ask_box(title: &str, text: &str) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{IDYES, MB_ICONWARNING, MB_SETFOREGROUND, MB_YESNO};
+    unsafe {
+        MessageBoxW(std::ptr::null_mut(), wide(text).as_ptr(), wide(title).as_ptr(), MB_YESNO | MB_ICONWARNING | MB_SETFOREGROUND)
+            == IDYES
+    }
+}

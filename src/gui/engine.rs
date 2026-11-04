@@ -1,9 +1,12 @@
 //! Создание и отключение диска в фоновом потоке; интерфейс только читает
-//! состояние и забирает события.
+//! состояние (снимок `View`) и забирает события.
+//!
+//! Движок работает в фоновой части VramDisk (`--serve`), а окно получает
+//! снимки по именованному каналу. В демо-режиме движок живёт прямо в окне.
 
 use super::platform::{self, Unmount};
 use super::widgets::StepMark;
-use eframe::egui;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -14,10 +17,13 @@ use vramdisk::logger::log;
 use vramdisk::pool::{self, SelfTest, SimStore, Store, CHUNK};
 use vramdisk::ram::RamStore;
 use vramdisk::settings::FsKind;
-use vramdisk::stats::Stats;
+use vramdisk::stats::{Snapshot, Stats};
 use vramdisk::util::size as fsize;
 
-#[derive(Clone, Debug)]
+/// Как сообщить интерфейсу, что состояние изменилось.
+pub type Notify = Arc<dyn Fn() + Send + Sync>;
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CreateRequest {
     /// Размер диска: сумма пределов.
     pub size: u64,
@@ -36,14 +42,14 @@ pub struct CreateRequest {
     pub demo: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Step {
     pub title: String,
     pub mark: StepMark,
     pub detail: Option<String>,
 }
 
-pub struct Creating {
+struct Creating {
     pub letter: char,
     pub total: u64,
     pub steps: Vec<Step>,
@@ -51,7 +57,57 @@ pub struct Creating {
     pub can_cancel: bool,
 }
 
-pub struct Mounted {
+struct Mounted {
+    letter: char,
+    label: String,
+    fs: FsKind,
+    size: u64,
+    ram: u64,
+    vram: u64,
+    first: Kind,
+    gpu_name: Option<String>,
+    /// Через что подключена видеопамять: «Vulkan 1.3.287», «Direct3D 11».
+    gpu_api: Option<String>,
+    test: Option<SelfTest>,
+    notes: Vec<String>,
+    stats: Arc<Stats>,
+    device: Option<u32>,
+    since: Instant,
+    server: platform::Server,
+}
+
+// Состояние одно на всё приложение и почти не перемещается: упаковывать
+// большой вариант в Box незачем.
+#[allow(clippy::large_enum_variant)]
+enum Phase {
+    Idle,
+    Creating(Creating),
+    Mounted(Mounted),
+    Removing { letter: char, force: bool },
+}
+
+/// Снимок состояния для интерфейса (и для передачи окну по каналу).
+/// Делается несколько раз в секунду и сразу читается — упаковывать
+/// большой вариант незачем.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum View {
+    Idle,
+    Creating(CreatingView),
+    Mounted(MountedView),
+    Removing { letter: char, force: bool },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CreatingView {
+    pub letter: char,
+    pub total: u64,
+    pub steps: Vec<Step>,
+    pub can_cancel: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MountedView {
     pub letter: char,
     pub label: String,
     pub fs: FsKind,
@@ -60,31 +116,25 @@ pub struct Mounted {
     pub vram: u64,
     pub first: Kind,
     pub gpu_name: Option<String>,
-    /// Через что подключена видеопамять: «Vulkan 1.3.287», «Direct3D 11».
     pub gpu_api: Option<String>,
     pub test: Option<SelfTest>,
     pub notes: Vec<String>,
-    pub stats: Arc<Stats>,
     pub device: Option<u32>,
-    pub since: Instant,
-    pub server: platform::Server,
+    /// Сколько диск уже работает, мс.
+    pub uptime_ms: u64,
+    pub stats: Snapshot,
+    /// Сервер ImDisk отвечает.
+    pub running: bool,
 }
 
-// Состояние одно на всё приложение и почти не перемещается: упаковывать
-// большой вариант в Box незачем.
-#[allow(clippy::large_enum_variant)]
-pub enum Phase {
-    Idle,
-    Creating(Creating),
-    Mounted(Mounted),
-    Removing { letter: char, force: bool },
-}
-
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Event {
     Created { letter: char, device: Option<u32>, notes: Vec<String> },
     Failed { title: String, text: String },
     Busy { text: String },
     Removed,
+    /// Фоновая часть пропала, пока держала диск (только в окне).
+    Lost { letter: char },
 }
 
 struct Inner {
@@ -95,7 +145,7 @@ struct Inner {
 #[derive(Clone)]
 pub struct Engine {
     inner: Arc<Mutex<Inner>>,
-    ctx: egui::Context,
+    notify: Notify,
 }
 
 const STEP_IMDISK: usize = 0;
@@ -109,21 +159,98 @@ enum Fail {
     At(usize, String),
 }
 
+/// Шаги создания диска — до того, как они начались.
+pub fn initial_steps(req: &CreateRequest) -> Vec<Step> {
+    let t = |s: String| Step { title: s, mark: StepMark::Pending, detail: None };
+    let mut steps = vec![
+        t("Проверка ImDisk".into()),
+        t(format!("Оперативная память · до {}", fsize(req.ram))),
+        t(format!("Видеопамять · до {}", fsize(req.vram))),
+        t("Проверка видеопамяти".into()),
+        t(format!("Подключение и форматирование {}:", req.letter)),
+    ];
+    if req.ram == 0 {
+        steps[STEP_RAM].title = if req.vram > 0 {
+            "Оперативная память · только запас на случай, если видеопамять занята".into()
+        } else {
+            "Оперативная память не используется".into()
+        };
+    }
+    if req.vram == 0 {
+        steps[STEP_VRAM].mark = StepMark::Skipped;
+        steps[STEP_VRAM].title = "Видеопамять не используется".into();
+        steps[STEP_TEST].mark = StepMark::Skipped;
+    }
+    steps
+}
+
+/// Как выглядит создание диска, пока оно не началось.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn creating_view(req: &CreateRequest) -> View {
+    View::Creating(CreatingView { letter: req.letter, total: req.size, steps: initial_steps(req), can_cancel: true })
+}
+
 impl Engine {
-    pub fn new(ctx: egui::Context) -> Self {
-        Self { inner: Arc::new(Mutex::new(Inner { phase: Phase::Idle, events: VecDeque::new() })), ctx }
+    pub fn new(notify: Notify) -> Self {
+        Self { inner: Arc::new(Mutex::new(Inner { phase: Phase::Idle, events: VecDeque::new() })), notify }
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    pub fn with<R>(&self, f: impl FnOnce(&mut Phase) -> R) -> R {
-        f(&mut self.lock().phase)
+    pub fn view(&self) -> View {
+        match &self.lock().phase {
+            Phase::Idle => View::Idle,
+            Phase::Creating(c) => View::Creating(CreatingView {
+                letter: c.letter,
+                total: c.total,
+                steps: c.steps.clone(),
+                can_cancel: c.can_cancel,
+            }),
+            Phase::Mounted(m) => View::Mounted(MountedView {
+                letter: m.letter,
+                label: m.label.clone(),
+                fs: m.fs,
+                size: m.size,
+                ram: m.ram,
+                vram: m.vram,
+                first: m.first,
+                gpu_name: m.gpu_name.clone(),
+                gpu_api: m.gpu_api.clone(),
+                test: m.test,
+                notes: m.notes.clone(),
+                device: m.device,
+                uptime_ms: m.since.elapsed().as_millis() as u64,
+                stats: m.stats.snapshot(),
+                running: m.server.running(),
+            }),
+            Phase::Removing { letter, force } => View::Removing { letter: *letter, force: *force },
+        }
+    }
+
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn is_idle(&self) -> bool {
+        matches!(self.lock().phase, Phase::Idle)
     }
 
     pub fn events(&self) -> Vec<Event> {
         self.lock().events.drain(..).collect()
+    }
+
+    /// Диск сняли другой программой (например, ImDisk): сервер получил
+    /// CLOSE, а буквы больше нет — забыть о диске.
+    pub fn check_external(&self) {
+        let gone = match &self.lock().phase {
+            Phase::Mounted(m) => {
+                let stopped = m.stats.server_stopped.load(SeqCst);
+                stopped.then_some(m.letter)
+            }
+            _ => None,
+        };
+        if gone.is_some_and(|l| !platform::letter_used(l)) {
+            self.forget();
+        }
     }
 
     fn step(&self, i: usize, mark: StepMark, detail: Option<String>) {
@@ -135,7 +262,7 @@ impl Engine {
                 }
             }
         }
-        self.ctx.request_repaint();
+        (self.notify)();
     }
 
     pub fn create(&self, req: CreateRequest) {
@@ -145,30 +272,10 @@ impl Engine {
             if !matches!(g.phase, Phase::Idle) {
                 return;
             }
-            let t = |s: String| Step { title: s, mark: StepMark::Pending, detail: None };
-            let mut steps = vec![
-                t("Проверка ImDisk".into()),
-                t(format!("Оперативная память · до {}", fsize(req.ram))),
-                t(format!("Видеопамять · до {}", fsize(req.vram))),
-                t("Проверка видеопамяти".into()),
-                t(format!("Подключение и форматирование {}:", req.letter)),
-            ];
-            if req.ram == 0 {
-                steps[STEP_RAM].title = if req.vram > 0 {
-                    "Оперативная память · только запас на случай, если видеопамять занята".into()
-                } else {
-                    "Оперативная память не используется".into()
-                };
-            }
-            if req.vram == 0 {
-                steps[STEP_VRAM].mark = StepMark::Skipped;
-                steps[STEP_VRAM].title = "Видеопамять не используется".into();
-                steps[STEP_TEST].mark = StepMark::Skipped;
-            }
             g.phase = Phase::Creating(Creating {
                 letter: req.letter,
                 total: req.size,
-                steps,
+                steps: initial_steps(&req),
                 cancel: cancel.clone(),
                 can_cancel: true,
             });
@@ -188,26 +295,31 @@ impl Engine {
             .name("create-disk".into())
             .spawn(move || {
                 let r = me.run_create(&req, &cancel);
-                let mut g = me.lock();
-                match r {
-                    Ok(m) => {
-                        let (letter, device, notes) = (m.letter, m.device, m.notes.clone());
-                        g.phase = Phase::Mounted(m);
-                        g.events.push_back(Event::Created { letter, device, notes });
-                        drop(g);
-                        platform::arm_cleanup(Some(letter));
-                    }
-                    Err(Fail::Cancelled) => {
-                        log("создание диска отменено");
-                        g.phase = Phase::Idle;
-                    }
-                    Err(Fail::At(i, text)) => {
-                        log(format!("создание диска не удалось на шаге {i}: {text}"));
-                        g.phase = Phase::Idle;
-                        g.events.push_back(Event::Failed { title: "Не удалось создать диск".into(), text });
+                let mut armed = None;
+                {
+                    let mut g = me.lock();
+                    match r {
+                        Ok(m) => {
+                            let (letter, device, notes) = (m.letter, m.device, m.notes.clone());
+                            g.phase = Phase::Mounted(m);
+                            g.events.push_back(Event::Created { letter, device, notes });
+                            armed = Some(letter);
+                        }
+                        Err(Fail::Cancelled) => {
+                            log("создание диска отменено");
+                            g.phase = Phase::Idle;
+                        }
+                        Err(Fail::At(i, text)) => {
+                            log(format!("создание диска не удалось на шаге {i}: {text}"));
+                            g.phase = Phase::Idle;
+                            g.events.push_back(Event::Failed { title: "Не удалось создать диск".into(), text });
+                        }
                     }
                 }
-                me.ctx.request_repaint();
+                if armed.is_some() {
+                    platform::arm_cleanup(armed);
+                }
+                (me.notify)();
             })
             .expect("поток создания диска");
     }
@@ -401,40 +513,44 @@ impl Engine {
             }
         };
         log(format!("отключение диска {}:{}", m.letter, if force { " (принудительно)" } else { "" }));
-        self.ctx.request_repaint();
+        (self.notify)();
         let me = self.clone();
         std::thread::Builder::new()
             .name("remove-disk".into())
             .spawn(move || {
                 let mut m = m;
                 let r = platform::unmount(m.letter, &mut m.server, force);
-                let mut g = me.lock();
-                match r {
-                    Ok(()) => {
-                        let letter = m.letter;
-                        drop(m);
-                        g.phase = Phase::Idle;
-                        g.events.push_back(Event::Removed);
-                        drop(g);
-                        platform::arm_cleanup(None);
-                        log(format!("диск {letter}: отключён"));
-                    }
-                    Err(Unmount::Busy(t)) => {
-                        g.phase = Phase::Mounted(m);
-                        g.events.push_back(Event::Busy { text: t });
-                    }
-                    Err(Unmount::Failed(t)) => {
-                        g.phase = Phase::Mounted(m);
-                        g.events.push_back(Event::Failed { title: "Не удалось отключить диск".into(), text: t });
+                let mut removed = None;
+                {
+                    let mut g = me.lock();
+                    match r {
+                        Ok(()) => {
+                            removed = Some(m.letter);
+                            drop(m);
+                            g.phase = Phase::Idle;
+                            g.events.push_back(Event::Removed);
+                        }
+                        Err(Unmount::Busy(t)) => {
+                            g.phase = Phase::Mounted(m);
+                            g.events.push_back(Event::Busy { text: t });
+                        }
+                        Err(Unmount::Failed(t)) => {
+                            g.phase = Phase::Mounted(m);
+                            g.events.push_back(Event::Failed { title: "Не удалось отключить диск".into(), text: t });
+                        }
                     }
                 }
-                me.ctx.request_repaint();
+                if let Some(letter) = removed {
+                    platform::arm_cleanup(None);
+                    log(format!("диск {letter}: отключён"));
+                }
+                (me.notify)();
             })
             .expect("поток отключения диска");
     }
 
     /// Диск исчез без нас (снят другой программой): забыть о нём.
-    pub fn forget(&self) {
+    fn forget(&self) {
         let mut g = self.lock();
         if let Phase::Mounted(m) = &g.phase {
             log(format!("диск {}: снят извне", m.letter));
@@ -442,6 +558,7 @@ impl Engine {
             g.events.push_back(Event::Removed);
             drop(g);
             platform::arm_cleanup(None);
+            (self.notify)();
         }
     }
 }

@@ -18,7 +18,7 @@ pub const CHUNK: u64 = 64 << 20;
 /// Пустой кусок отдаётся не сразу: файлы часто удаляют и тут же пишут новые.
 pub const REAP_DELAY: Duration = Duration::from_secs(5);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Kind {
     Ram,
     Vram,
@@ -326,7 +326,7 @@ pub fn pattern(len: usize, seed: u64) -> Vec<u8> {
     v
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SelfTest {
     pub write_bps: f64,
     pub read_bps: f64,
