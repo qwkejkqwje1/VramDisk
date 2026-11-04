@@ -1,0 +1,35 @@
+// Ресурсы vramdisk.exe: значок, манифест, сведения о версии.
+#include <winver.h>
+#include "version.h" // создаётся build.rs в OUT_DIR
+
+1 ICON "icon.ico"
+1 24 "app.manifest"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     VER_MAJOR,VER_MINOR,VER_PATCH,0
+PRODUCTVERSION  VER_MAJOR,VER_MINOR,VER_PATCH,0
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+FILEFLAGS       0
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "CompanyName",      "VramDisk"
+      VALUE "FileDescription",  "VramDisk"
+      VALUE "FileVersion",      VER_STRING
+      VALUE "InternalName",     "vramdisk"
+      VALUE "LegalCopyright",   "MIT License"
+      VALUE "OriginalFilename", "vramdisk.exe"
+      VALUE "ProductName",      "VramDisk"
+      VALUE "ProductVersion",   VER_STRING
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
+END
